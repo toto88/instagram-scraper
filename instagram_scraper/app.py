@@ -830,7 +830,6 @@ class InstagramScraper(object):
             if self.filter:
                 if 'tags' in item:
                     filtered = any(x in item['tags'] for x in self.filter)
-                    print filtered
                     if self.has_selected_media_types(item) and self.is_new_media(item) and filtered:
                         item['username']=username
                         future = executor.submit(self.worker_wrapper, self.download, item, dst)
@@ -858,7 +857,6 @@ class InstagramScraper(object):
                 self.posts.append(item)
 
             iter = iter + 1
-            print iter
             if self.maximum != 0 and iter >= self.maximum:
                 break
 
@@ -1117,9 +1115,8 @@ class InstagramScraper(object):
                         print uploaded
 
     def upload_to_aws(self, local_file, bucket, s3_file):
-        #print "s3 prepare session"
-        # session = boto3.Session(profile_name='default')
-        # s3 = session.client('s3')
+        # we are using the default profile
+        
         try:
             s3 = boto3.client('s3')
             with open(local_file, "rb") as f:
@@ -1129,11 +1126,6 @@ class InstagramScraper(object):
             print("Unexpected error: %s" % e)
             return "fail upload file"
 
-        # if not os.path.isfile(local_file):
-        #     return "file "+local_file+" does not exist"
-        # else:
-        #     s3.upload_file(local_file, bucket, s3_file)
-        #     return "Upload Successful"
 
 
     def templatefilename(self, item):
