@@ -16,6 +16,8 @@ import re
 import sys
 import textwrap
 import time
+import boto3
+from botocore.exceptions import ClientError
 
 try:
     from urllib.parse import urlparse
@@ -83,7 +85,7 @@ class InstagramScraper(object):
         default_attr = dict(username='', usernames=[], filename=None,
                             login_user=None, login_pass=None,
                             followings_input=False, followings_output='profiles.txt',
-                            destination='./', logger=None, retain_username=False, interactive=False,
+                            destination='./',destination_s3=False, logger=None, retain_username=False, interactive=False,
                             quiet=False, maximum=0, media_metadata=False, profile_metadata=False, latest=False,
                             latest_stamps=False, cookiejar=None,
                             media_types=['image', 'video', 'story-image', 'story-video'],
@@ -318,6 +320,15 @@ class InstagramScraper(object):
             else:
                 dst = self.destination
 
+
+    def get_dst_bucket(self, username):
+        """Gets the destination bucket and last scraped file time."""
+        if self.retain_username:
+            dst = self.destination_s3 + '/' + username
+        else:
+            dst = self.destination_s3
+
+
         # Resolve last scraped filetime
         if self.latest_stamps_parser:
             self.last_scraped_filemtime = self.get_last_scraped_timestamp(username)
@@ -455,7 +466,13 @@ class InstagramScraper(object):
                 greatest_timestamp = 0
                 future_to_item = {}
 
-                dst = self.get_dst_dir(value)
+                #check if the destination is regular directory or s3 bucket
+                if self.destination_s3:
+                    dst = self.get_dst_bucket(value)
+                else:
+                    dst = self.get_dst_dir(value)
+
+
 
                 if self.include_location:
                     media_exec = concurrent.futures.ThreadPoolExecutor(max_workers=5)
@@ -463,11 +480,28 @@ class InstagramScraper(object):
                 iter = 0
                 for item in tqdm.tqdm(media_generator(value), desc='Searching {0} for posts'.format(value), unit=" media",
                                       disable=self.quiet):
-                    if ((item['is_video'] is False and 'image' in self.media_types) or \
-                                (item['is_video'] is True and 'video' in self.media_types)
-                        ) and self.is_new_media(item):
-                        future = executor.submit(self.worker_wrapper, self.download, item, dst)
-                        future_to_item[future] = item
+                    # -Filter command line
+                    if self.filter:
+                        if ((item['is_video'] is False and 'image' in self.media_types) or \
+                            (item['is_video'] is True and 'video' in self.media_types)) and self.is_new_media(item):
+                            if 'tags' in item:
+                                filtered = any(x in item['tags'] for x in self.filter)
+                                if self.has_selected_media_types(item) and self.is_new_media(item) and filtered:
+                                    future = executor.submit(self.worker_wrapper, self.download, item, dst)
+                                    future_to_item[future] = item
+                                    if self.media_metadata or self.comments or self.include_location:
+                                        self.posts.append(item)
+                            else:
+                                # For when filter is on but media doesnt contain tags
+                                pass
+                            # --------------#
+                    else:
+                        if ((item['is_video'] is False and 'image' in self.media_types) or \
+                                    (item['is_video'] is True and 'video' in self.media_types)) and self.is_new_media(item):
+                            future = executor.submit(self.worker_wrapper, self.download, item, dst)
+                            future_to_item[future] = item
+                            if self.media_metadata or self.comments or self.include_location:
+                                self.posts.append(item)
 
                     if self.include_location and 'location' not in item:
                         media_exec.submit(self.worker_wrapper, self.__get_location, item)
@@ -475,8 +509,6 @@ class InstagramScraper(object):
                     if self.comments:
                         item['edge_media_to_comment']['data'] = list(self.query_comments_gen(item['shortcode']))
 
-                    if self.media_metadata or self.comments or self.include_location:
-                        self.posts.append(item)
 
                     iter = iter + 1
                     if self.maximum != 0 and iter >= self.maximum:
@@ -513,6 +545,7 @@ class InstagramScraper(object):
 
     def query_location_gen(self, location):
         return self.__query_gen(QUERY_LOCATION, QUERY_LOCATION_VARS, 'location', location)
+
 
     def __query_gen(self, url, variables, entity_name, query, end_cursor=''):
         """Generator for hashtag and location."""
@@ -619,7 +652,11 @@ class InstagramScraper(object):
                 greatest_timestamp = 0
                 future_to_item = {}
 
-                dst = self.get_dst_dir(username)
+                #check if the destinstion is regular directory or s3 bucket
+                if self.destination_s3:
+                    dst = self.get_dst_bucket(username)
+                else:
+                    dst = self.get_dst_dir(username)
 
                 # Get the user metadata.
                 shared_data = self.get_shared_data(username)
@@ -793,6 +830,7 @@ class InstagramScraper(object):
             if self.filter:
                 if 'tags' in item:
                     filtered = any(x in item['tags'] for x in self.filter)
+                    print filtered
                     if self.has_selected_media_types(item) and self.is_new_media(item) and filtered:
                         item['username']=username
                         future = executor.submit(self.worker_wrapper, self.download, item, dst)
@@ -820,6 +858,7 @@ class InstagramScraper(object):
                 self.posts.append(item)
 
             iter = iter + 1
+            print iter
             if self.maximum != 0 and iter >= self.maximum:
                 break
 
@@ -1073,6 +1112,29 @@ class InstagramScraper(object):
                     timestamp = self.__get_timestamp(item)
                     file_time = int(timestamp if timestamp else time.time())
                     os.utime(file_path, (file_time, file_time))
+                    if bool(self.destination_s3):
+                        uploaded = self.upload_to_aws(file_path, self.destination_s3, file_path)
+                        print uploaded
+
+    def upload_to_aws(self, local_file, bucket, s3_file):
+        #print "s3 prepare session"
+        # session = boto3.Session(profile_name='default')
+        # s3 = session.client('s3')
+        try:
+            s3 = boto3.client('s3')
+            with open(local_file, "rb") as f:
+                s3.upload_fileobj(f, bucket, s3_file)
+                return "file uploaded"
+        except ClientError as e:
+            print("Unexpected error: %s" % e)
+            return "fail upload file"
+
+        # if not os.path.isfile(local_file):
+        #     return "file "+local_file+" does not exist"
+        # else:
+        #     s3.upload_file(local_file, bucket, s3_file)
+        #     return "Upload Successful"
+
 
     def templatefilename(self, item):
 
@@ -1295,6 +1357,7 @@ def main():
 
     parser.add_argument('username', help='Instagram user(s) to scrape', nargs='*')
     parser.add_argument('--destination', '-d', default='./', help='Download destination')
+    parser.add_argument('--destination-s3', '-ds3', default=False, help='Download destination to s3 bucket')
     parser.add_argument('--login-user', '--login_user', '-u', default=None, help='Instagram login user')
     parser.add_argument('--login-pass', '--login_pass', '-p', default=None, help='Instagram login password')
     parser.add_argument('--followings-input', '--followings_input', action='store_true', default=False,
